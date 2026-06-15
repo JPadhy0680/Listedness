@@ -4,8 +4,11 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 from datetime import datetime, date
 import io
+import zipfile
 import re
 import calendar
+import html
+from pathlib import Path
 from typing import Optional, Set, Tuple, List, Dict
 
 st.set_page_config(page_title="E2B_R3 XML Triage Application", layout="wide")
@@ -14,7 +17,7 @@ st.markdown(""" """, unsafe_allow_html=True)
 st.title("\U0001F4CA\U0001F9E0 E2B_R3 XML Triage Application \U0001F6E0\ufe0f \U0001F680")
 
 # ---------------------------------------------------------------------------------------------------------
-# v1.10.3 - per-product event-wise listedness display, password removed, no debug prints
+# v1.10.9 - editable validity + revised XML naming convention + molecule-only filenames
 # - Event Details column shows ONLY clinical details (no "Listedness:" fragments).
 # - Listedness column:
 #    * If exactly one Celix suspect product: show per-event lines (e.g., "Event 1: Listed").
@@ -32,7 +35,7 @@ with st.expander("\U0001F4D6 Instructions"):
   We will compute **Listedness per event** and show it in a separate **Listedness** column.
 - If the case has **2 or more Celix suspect products**, the **Listedness** column shows one line per product:
   `Drug X - Event 1: Listed; Event 2: Unlisted; ...`
-- Parsed data appears in the **Export & Edit** tab. **All columns are read-only.**
+- Parsed data appears in the **Export & Edit** tab. **Validity** is editable; other columns are read-only.
 """)
 
 def _digits_only(s: str) -> str:
@@ -121,6 +124,87 @@ def is_unknown(value: str) -> bool:
 def clean_value(value: str) -> str:
     return "" if is_unknown(value) else str(value)
 
+def extract_td_value(report_date_display: str) -> str:
+    if not report_date_display:
+        return ""
+    for line in str(report_date_display).splitlines():
+        if line.strip().upper().startswith("TD:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+def build_tracker_comment(validity_value: str, comment_value: str) -> str:
+    parts: List[str] = []
+    validity_text = clean_value(validity_value)
+    comment_text = clean_value(comment_value)
+
+    m = re.match(r"Non-Valid\s*\((.*?)\)", validity_text, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        reason = " ".join(m.group(1).split())
+        if reason:
+            parts.append(reason)
+        remainder = validity_text[m.end():].strip()
+        if remainder:
+            parts.append(" ".join(remainder.split()))
+    elif validity_text and validity_text != "Valid":
+        parts.append(" ".join(validity_text.split()))
+
+    if comment_text:
+        parts.append(" ".join(comment_text.split()))
+
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for item in parts:
+        key = item.lower()
+        if item and key not in seen:
+            deduped.append(item)
+            seen.add(key)
+    return "; ".join(deduped)
+
+def simplify_tracker_validity(validity_value: str) -> str:
+    validity_text = clean_value(validity_value)
+    if validity_text.startswith("Non-Valid"):
+        return "Non-Valid"
+    return validity_text
+
+def simplify_tracker_product(product_value: str) -> str:
+    if not product_value:
+        return ""
+
+    products = [p.strip() for p in str(product_value).split(";") if p.strip()]
+    cleaned_products: List[str] = []
+    seen: Set[str] = set()
+
+    for product in products:
+        norm = normalize_text(product)
+        matched = ""
+
+        for prod in company_products:
+            pnorm = normalize_text(prod)
+            if not pnorm:
+                continue
+            pattern = r'\b' + re.escape(pnorm) + r'\b'
+            if re.search(pattern, norm):
+                matched = prod.title()
+                break
+
+        if not matched:
+            temp = product
+            temp = re.sub(r'(?i)\b\d+(?:\.\d+)?\s*(mg|mcg|g|ml)\b', '', temp)
+            temp = re.sub(
+                r'(?i)\b(tab|tabs|tablet|tablets|cap|caps|capsule|capsules|syrup|inj|injection|vial|amp|ampoule|suspension|oral|solution|cream|gel|ointment)\b',
+                '',
+                temp,
+            )
+            temp = re.sub(r'\s+', ' ', temp).strip(" -_,;/")
+            matched = temp.title()
+
+        key = matched.lower()
+        if matched and key not in seen:
+            cleaned_products.append(matched)
+            seen.add(key)
+
+    return "; ".join(cleaned_products)
+
 def normalize_text(s: str) -> str:
     s = (s or "").lower()
     s = re.sub(r'[^a-z0-9\s\+\-]', ' ', s)
@@ -176,18 +260,16 @@ def contains_competitor_name(lot_text: str, competitor_names: Set[str]) -> bool:
     return False
 
 company_products = [
-    "abiraterone", "apixaban", "apremilast", "bexarotene", "clobazam", "clonazepam",
-    "cyanocobalamin", "dabigatran", "dapagliflozin", "dimethyl fumarate", "famotidine",
-    "fesoterodine", "icatibant", "itraconazole", "linagliptin", "linagliptin + metformin",
-    "nintedanib", "pirfenidone", "raltegravir", "ranolazine", "rivaroxaban", "saxagliptin",
-    "sitagliptin", "tamsulosin + solifenacin", "tapentadol", "ticagrelor", "tamsulosin",
-    "solifenacin", "cyclogest", "progesterone", "luteum", "amelgen"
+    "abiraterone", "apixaban", "apremilast", "bexarotene", "brivaracetam", "clobazam", "clonazepam",
+    "cyanocobalamin", "dabigatran", "dapagliflozin","dimethyl fumarate", "edoxaban", "empagliflozin", "famotidine",
+    "fesoterodine", "icatibant", "itraconazole", "linagliptin", "linagliptin + metformin", "metformin", "nintedanib", "pirfenidone", "raltegravir", "ranolazine", "rivaroxaban", "safinamide", "saxagliptin",
+    "sitagliptin", "sacubritril + valsartan", "sacubritril", "valsartan", "tamsulosin + solifenacin", "tapentadol", "ticagrelor", "tamsulosin",
+    "solifenacin"
 ]
 
 category2_products = {
     "clobazam", "clonazepam", "cyanocobalamin", "famotidine", "itraconazole",
-    "tamsulosin", "solifenacin", "tapentadol", "cyclogest", "progesterone",
-    "luteum", "amelgen"
+    "tamsulosin", "solifenacin", "tapentadol"
 }
 
 def parse_dd_mmm_yy(s):
@@ -196,23 +278,38 @@ def parse_dd_mmm_yy(s):
 LAUNCH_INFO = {
     "abiraterone": ("launched", parse_dd_mmm_yy("08-Sep-22")),
     "apixaban": ("launched", parse_dd_mmm_yy("26-Feb-25")),
-    "apremilast": ("yet", None),
+    "apremilast": ("launched", parse_dd_mmm_yy("19-Jan-26")),
     "bexarotene": ("launched", parse_dd_mmm_yy("19-Jan-23")),
+    "brivaracetam": ("awaited", None),
     "clobazam": ("launched", parse_dd_mmm_yy("26-Sep-24")),
     "clonazepam": ("launched", parse_dd_mmm_yy("20-Jan-25")),
+    "clobazam": ("launched_by_strength", {
+        10.0: parse_dd_mmm_yy("26-Sep-24"),
+        20.0: None 
+    }),
     "cyanocobalamin": ("awaited", None),
     "dabigatran": ("yet", None),
-    "dapagliflozin": ("launched_by_strength", {10.0: parse_dd_mmm_yy("26-Aug-25"), 5.0: parse_dd_mmm_yy("10-Sep-25")}),
+    "dapagliflozin": ("launched_by_strength", {
+        10.0: parse_dd_mmm_yy("26-Aug-25"), 
+        5.0: parse_dd_mmm_yy("10-Sep-25")
+    }),
     "dimethyl fumarate": ("launched", parse_dd_mmm_yy("05-Feb-24")),
+    "edoxaban": ("awaited", None),
+    "empagliflozin": ("awaited", None),
     "famotidine": ("launched", parse_dd_mmm_yy("21-Feb-25")),
     "fesoterodine": ("yet", None),
     "icatibant": ("launched", parse_dd_mmm_yy("28-Jul-22")),
     "itraconazole": ("awaited", None),
     "linagliptin": ("yet", None),
-    "linagliptin + metformin": ("awaited", None),
-    "nintedanib": ("awaited", None),
-    "pirfenidone": ("launched", parse_dd_mmm_yy("29-Jun-22")),
-    "raltegravir": ("awaited", None),
+    "linagliptin + metformin": ("yet", None),
+    "metformin": ("yet", None),
+    "nintedanib": ("launched", parse_dd_mmm_yy("28-Apr-26")),
+    "pirfenidone": ("launched_by_strength", {
+        267.0: parse_dd_mmm_yy("29-Jun-22"),
+        801.0: parse_dd_mmm_yy("29-Jun-22"),
+        534.0: None 
+    }),
+    "raltegravir": ("yet", None),
     "ranolazine": ("launched", parse_dd_mmm_yy("20-Jul-23")),
     "rivaroxaban": ("launched_by_strength", {
         2.5: parse_dd_mmm_yy("02-Apr-24"),
@@ -220,33 +317,156 @@ LAUNCH_INFO = {
         15.0: parse_dd_mmm_yy("23-May-24"),
         20.0: parse_dd_mmm_yy("23-May-24")
     }),
-    "saxagliptin": ("yet", None),
-    "sitagliptin": ("yet", None),
+    "safinamide": ("launched", parse_dd_mmm_yy("28-Apr-26")), 
+    "saxagliptin": ("launched_by_strength", {
+        5.0: parse_dd_mmm_yy("17-Apr-26"),
+        2.5: parse_dd_mmm_yy("20-May-26") 
+    }),
+    "sitagliptin": ("launched", parse_dd_mmm_yy("12-Mar-26")),
+    "sacubritril + valsartan": ("awaited", None),
     "tamsulosin + solifenacin": ("launched", parse_dd_mmm_yy("08-May-23")),
     "tamsulosin": ("launched", parse_dd_mmm_yy("08-May-23")),
     "solifenacin": ("launched", parse_dd_mmm_yy("08-May-23")),
     "tapentadol": ("launched", parse_dd_mmm_yy("01-Feb-24")),
     "ticagrelor": ("yet", None),
-    "cyclogest": ("launched", None),
-    "progesterone": ("launched", None),
-    "luteum": ("launched", None),
-    "amelgen": ("launched", None),
+    }
+
+# Strength master list supplied by Jagamohan (values are in mg).
+PRODUCT_STRENGTHS_MG: Dict[str, Set[Tuple[float, ...]]] = {
+    "abiraterone": {(500.0,)}, "apixaban": {(2.5,), (5.0,)}, "apremilast": {(10.0,), (20.0,), (30.0,)},
+    "bexarotene": {(75.0,)}, "brivaracetam": {(10.0,), (25.0,), (50.0,), (75.0,), (100.0,)},
+    "clobazam": {(10.0,)}, "clonazepam": {(0.5,), (2.0,)}, "cyanocobalamin": {(1.0,)},
+    "dabigatran": {(75.0,), (110.0,), (150.0,)}, "dapagliflozin": {(5.0,), (10.0,)}, "dapagliflozine": {(5.0,), (10.0,)},
+    "dimethyl fumarate": {(120.0,), (240.0,)}, "edoxaban": {(15.0,), (30.0,), (60.0,)}, "empagliflozin": {(10.0,), (25.0,)},
+    "famotidine": {(20.0,), (40.0,)}, "fesoterodine": {(4.0,), (8.0,)}, "icatibant": {(30.0,)}, "itraconazole": {(100.0,)},
+    "linagliptin": {(5.0,)}, "linagliptin + metformin": {(2.5, 850.0), (2.5, 1000.0)}, "metformin": {(850.0,), (1000.0,)},
+    "nintedanib": {(100.0,), (150.0,)}, "pirfenidone": {(267.0,), (801.0,)}, "raltegravir": {(600.0,)},
+    "ranolazine": {(375.0,), (500.0,), (750.0,)}, "rivaroxaban": {(2.5,), (10.0,), (15.0,), (20.0,)},
+    "safinamide": {(50.0,), (100.0,)}, "saxagliptin": {(2.5,), (5.0,)}, "sitagliptin": {(25.0,), (50.0,), (100.0,)},
+    "sacubritril + valsartan": {(24.0, 26.0), (49.0, 51.0), (97.0, 103.0)}, "sacubitril + valsartan": {(24.0, 26.0), (49.0, 51.0), (97.0, 103.0)},
+    "sacubritril": {(24.0,), (49.0,), (97.0,)}, "valsartan": {(26.0,), (51.0,), (103.0,)},
+    "tamsulosin + solifenacin": {(6.0, 0.4)}, "tamsulosin": {(0.4,)}, "solifenacin": {(6.0,)},
+    "tapentadol": {(50.0,), (100.0,), (150.0,), (200.0,), (250.0,)}, "ticagrelor": {(60.0,), (90.0,)},
 }
+
+def _norm_strength_number(num: float) -> float:
+    try: return round(float(num), 6)
+    except Exception: return num
+
+def _norm_strength_tuple(values) -> Tuple[float, ...]:
+    return tuple(_norm_strength_number(v) for v in values)
+
+def extract_strengths_mg(*texts: str) -> Tuple[float, ...]:
+    combined = " ".join(str(t or "") for t in texts)
+    if not combined.strip(): return tuple()
+    combined = combined.replace("&amp;", "&").replace("&", " ").replace("/", " / ").replace("+", " + ").replace(",", " , ")
+    return tuple(_norm_strength_number(float(m.group(1))) for m in re.finditer(r'(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*mg\b', combined, flags=re.IGNORECASE))
+
+def extract_ingredient_strengths_mg(drug, ns) -> Tuple[float, ...]:
+    values, seen = [], set()
+    numerator_paths = [
+        './/hl7:kindOfProduct/hl7:manufacturedProduct/hl7:ingredient/hl7:quantity/hl7:numerator',
+        './/hl7:manufacturedProduct/hl7:ingredient/hl7:quantity/hl7:numerator',
+        './/hl7:ingredient/hl7:quantity/hl7:numerator',
+    ]
+    for path in numerator_paths:
+        for numerator in drug.findall(path, ns):
+            value = numerator.attrib.get('value', '')
+            unit = numerator.attrib.get('unit', '')
+            key = (value, unit)
+            if key in seen: continue
+            seen.add(key)
+            if value and str(unit).strip().lower() == 'mg':
+                try: values.append(_norm_strength_number(float(value)))
+                except Exception: pass
+    return tuple(values)
+
+def allowed_strengths_for_product(product_name: str) -> Set[Tuple[float, ...]]:
+    return PRODUCT_STRENGTHS_MG.get(normalize_text(product_name), set())
+
+def is_strength_allowed_for_product(product_name: str, observed_strengths) -> bool:
+    allowed = allowed_strengths_for_product(product_name)
+    if not allowed or observed_strengths is None: return True
+    observed = (_norm_strength_number(observed_strengths),) if isinstance(observed_strengths, (int, float)) else _norm_strength_tuple(observed_strengths)
+    if not observed: return True
+    if observed in allowed: return True
+    if all(len(a) == 1 for a in allowed):
+        allowed_single_values = {a[0] for a in allowed}
+        return all(v in allowed_single_values for v in observed)
+    return False
+
+def format_strength_tuple(strengths) -> str:
+    if strengths is None: return ""
+    if isinstance(strengths, (int, float)): strengths = (strengths,)
+    out = []
+    for v in strengths:
+        fv = float(v)
+        out.append(str(int(fv)) if fv.is_integer() else str(fv))
+    return " / ".join(out) + " mg" if out else ""
+
+def strength_comment_for_product(product_name: str, observed_strengths) -> str:
+    if observed_strengths and not is_strength_allowed_for_product(product_name, observed_strengths):
+        allowed = allowed_strengths_for_product(product_name)
+        allowed_text = ", ".join(sorted(format_strength_tuple(a) for a in allowed)) if allowed else "not configured"
+        return f"Product strength mismatch for {product_name}: extracted {format_strength_tuple(observed_strengths)}; allowed strength(s): {allowed_text}."
+    return ""
+
+def sanitize_filename_component(value: str, fallback: str = "Unknown") -> str:
+    value = clean_value(value)
+    value = str(value or "").strip() or fallback
+    value = re.sub(r'[<>:"/\\|?*]+', '_', value)
+    value = re.sub(r'\s+', '_', value)
+    value = re.sub(r'_+', '_', value).strip('._ ')
+    return value or fallback
+
+def build_suggested_xml_filename(safety_id: str, validity_value: str, is_serious: bool, molecule_names: List[str], fallback_stem: str = "XML") -> str:
+    """Valid cases: SafetyID_S/NS_Molecule.xml; Non-Valid cases: SafetyID_NV_Molecule.xml."""
+    safety_part = sanitize_filename_component(safety_id, fallback_stem)
+    clean_molecules = [sanitize_filename_component(m, "") for m in molecule_names if sanitize_filename_component(m, "")]
+    molecule_part = "+".join(clean_molecules) if clean_molecules else "UnknownMolecule"
+    if isinstance(validity_value, str) and validity_value.startswith("Non-Valid"):
+        return f"{safety_part}_NV_{molecule_part}.xml"
+    seriousness_part = "S" if is_serious else "NS"
+    return f"{safety_part}_{seriousness_part}_{molecule_part}.xml"
+
+def make_unique_filename(filename: str, used_names: Set[str]) -> str:
+    base = filename[:-4] if filename.lower().endswith('.xml') else filename
+    candidate, counter = f"{base}.xml", 2
+    while candidate.lower() in used_names:
+        candidate = f"{base}_{counter}.xml"
+        counter += 1
+    used_names.add(candidate.lower())
+    return candidate
 
 def get_launch_date(product_name: str, strength_mg) -> Optional[date]:
     key = normalize_text(product_name)
     info = LAUNCH_INFO.get(key)
     if not info:
         return None
+    if not is_strength_allowed_for_product(product_name, strength_mg):
+        return None
     status, payload = info
     if status == "launched":
         return payload
     if status == "launched_by_strength":
         if isinstance(payload, dict) and payload:
-            if strength_mg is not None:
-                return payload.get(strength_mg) if strength_mg in payload else payload.get(float(strength_mg))  # type: ignore
-            return min(payload.values())
-        return None
+            strength_key = None
+            if isinstance(strength_mg, (tuple, list)):
+                if len(strength_mg) > 0:
+                    strength_key = strength_mg[0]
+            elif strength_mg is not None:
+                strength_key = strength_mg
+
+            if strength_key is not None:
+                try:
+                    if strength_key in payload:
+                        return payload.get(strength_key)
+                    return payload.get(float(strength_key))
+                except Exception:
+                    pass
+
+            dates = [d for d in payload.values() if d is not None]
+            return min(dates) if dates else None
     return None
 
 def get_launch_status(product_name: str) -> Optional[str]:
@@ -256,13 +476,105 @@ def get_launch_status(product_name: str) -> Optional[str]:
         return None
     return info[0]
 
+
+
+def local_tag_name(tag: str) -> str:
+    return str(tag).split('}', 1)[-1].lower() if tag else ''
+
+
+def xml_text_or_attr(elem, *attr_names: str) -> str:
+    if elem is None:
+        return ''
+    text_value = clean_value(elem.text or '')
+    if text_value:
+        return text_value
+    for attr_name in attr_names:
+        attr_value = clean_value(elem.attrib.get(attr_name, ''))
+        if attr_value:
+            return attr_value
+    return ''
+
+
+def _first_xml_value_by_local_names(root: ET.Element, local_names, attr_names=('extension', 'value', 'root')) -> str:
+    wanted = {str(name).strip().lower() for name in local_names if str(name).strip()}
+    if root is None or not wanted:
+        return ''
+    for elem in root.iter():
+        if local_tag_name(elem.tag) in wanted:
+            value = xml_text_or_attr(elem, *attr_names)
+            if value:
+                return value
+    return ''
+
+
+def _all_xml_values_by_local_name(root: ET.Element, local_name: str, attr_names=('extension', 'value', 'root')) -> List[str]:
+    matches: List[str] = []
+    wanted = str(local_name or '').strip().lower()
+    if root is None or not wanted:
+        return matches
+    for elem in root.iter():
+        if local_tag_name(elem.tag) == wanted:
+            value = xml_text_or_attr(elem, *attr_names)
+            if value:
+                matches.append(value)
+    return matches
+
+
+def classify_ack_validity(ack_code: str, error_comment: str) -> str:
+    ack_code_norm = clean_value(ack_code).zfill(2)
+    error_present = bool(clean_value(error_comment))
+    if ack_code_norm in {'01', '1'} and not error_present:
+        return 'Valid'
+    return 'Non-Valid'
+
+
+def parse_ack_xml_metadata(xml_bytes: bytes, original_name: str) -> Dict[str, str]:
+    fallback_stem = Path(original_name).stem
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception as exc:
+        return {
+            'Original File Name': original_name,
+            'Sender ID': fallback_stem,
+            'Safety Report ID': '',
+            'ACK Code': '',
+            'ACK Status': 'Non-Valid',
+            'Error Comment': f'XML parse error: {exc}',
+            'Renamed File Name': f'{sanitize_filename_component(fallback_stem)}_Ack.xml',
+        }
+
+    sender_id = _first_xml_value_by_local_names(
+        root,
+        ['senderidentifier', 'senderid', 'sender', 'sendername', 'sendingorganization', 'sendingorganizationidentifier']
+    )
+    if not sender_id:
+        sender_id = fallback_stem
+
+    safety_report_id = _first_xml_value_by_local_names(root, ['safetyreportid'])
+    ack_code = _first_xml_value_by_local_names(root, ['reportacknowledgmentcode', 'acknowledgmentcode', 'ackcode'])
+    error_comment = _first_xml_value_by_local_names(root, ['errormessagecomment', 'errorcomment', 'errortext'])
+    ack_status = classify_ack_validity(ack_code, error_comment)
+    renamed_file_name = f"{sanitize_filename_component(sender_id)}_Ack.xml"
+
+    return {
+        'Original File Name': original_name,
+        'Sender ID': sender_id,
+        'Safety Report ID': safety_report_id,
+        'ACK Code': ack_code,
+        'ACK Status': ack_status,
+        'Error Comment': error_comment,
+        'Renamed File Name': renamed_file_name,
+    }
+
 # -------------------------------- UI: Upload & Parse --------------------------
 
-tab1, tab2 = st.tabs(["Upload & Parse", "Export & Edit"])
+tab1, tab2, tab3, tab4 = st.tabs(["Upload & Parse", "Export & Edit", "Tracker Copy", "ACK Renamer"])
+edited_df = None
 if "uploader_version" not in st.session_state:
     st.session_state["uploader_version"] = 0
 
 all_rows_display: List[Dict] = []
+renamed_xml_meta: Dict[int, Dict] = {}
 current_date = datetime.now().strftime("%d-%b-%Y")
 
 with tab1:
@@ -331,8 +643,9 @@ with tab1:
             warnings: List[str] = []
             comments: List[str] = []
             try:
-                tree = ET.parse(uploaded_file)
-                root = tree.getroot()
+                xml_bytes = uploaded_file.getvalue()
+                root = ET.fromstring(xml_bytes)
+                original_file_stem = Path(getattr(uploaded_file, 'name', f'XML_{idx}')).stem
             except Exception as e:
                 st.error(f"Failed to parse XML file {getattr(uploaded_file, 'name', '(unnamed)')}: {e}")
                 progress.progress(idx / total_files)
@@ -447,7 +760,7 @@ with tab1:
                 patient_parts.append(f"Record No: {patient_record_no}")
             patient_detail = ", ".join(patient_parts)
 
-            has_any_patient_detail = any([patient_initials, gender, age_group, age, height, weight])
+            has_any_patient_detail = any([patient_initials, gender, age_group, age, height, weight,patient_record_no])
 
             # Identify suspect products (value==1)
             suspect_ids: List[str] = []
@@ -465,6 +778,7 @@ with tab1:
             case_displayed_mahs: List[str] = []
             case_products_norm: Set[str] = set()
             product_norm_to_pretty: Dict[str, str] = {}
+            suspect_product_names_all: List[str] = []
 
             displayed_drugs_assessment: List[Tuple[str, str]] = []
 
@@ -487,6 +801,11 @@ with tab1:
                         alt_name = drug.find('.//hl7:manufacturedProduct/hl7:name', ns)
                         if alt_name is not None and alt_name.text and alt_name.text.strip():
                             raw_drug_text = alt_name.text.strip()
+
+                    if raw_drug_text:
+                        cleaned_suspect_name = clean_value(raw_drug_text)
+                        if cleaned_suspect_name:
+                            suspect_product_names_all.append(cleaned_suspect_name)
 
                     def contains_company_product(text: str, company_products: list) -> str:
                         norm = normalize_text(text)
@@ -569,6 +888,20 @@ with tab1:
                         if form_clean:
                             parts.append(f"Formulation: {form_clean}")
 
+                        ingredient_strengths = extract_ingredient_strengths_mg(drug, ns)
+                        product_name_strengths = extract_strengths_mg(display_name_for_detail)
+                        observed_strengths = ingredient_strengths or product_name_strengths
+
+                        if ingredient_strengths:
+                            parts.append(f"XML Ingredient Strength: {format_strength_tuple(ingredient_strengths)}")
+                        if product_name_strengths:
+                            parts.append(f"Product Name Strength: {format_strength_tuple(product_name_strengths)}")
+                        if ingredient_strengths and product_name_strengths and ingredient_strengths != product_name_strengths:
+                            comments.append(f"Product strength mismatch between XML ingredient field and product name for {display_name_for_detail}: XML ingredient strength {format_strength_tuple(ingredient_strengths)} vs product name strength {format_strength_tuple(product_name_strengths)}.")
+                        strength_comment = strength_comment_for_product(matched_company_prod, observed_strengths)
+                        if strength_comment:
+                            comments.append(strength_comment)
+
                         lot_elem = drug.find('.//hl7:lotNumberText', ns)
                         lot_clean = ""
                         if lot_elem is not None and lot_elem.text:
@@ -605,7 +938,7 @@ with tab1:
                             if status in ("yet", "awaited"):
                                 non_valid_reason = "Product not Launched"
                             else:
-                                launch_dt = get_launch_date(matched_company_prod, None)
+                                launch_dt = get_launch_date(matched_company_prod, observed_strengths)
                                 exposure_reasons = []
                                 # We'll use FRD/LRD computed later
                                 drug_prior = (start_date_obj and start_date_obj < (launch_dt or start_date_obj)) if launch_dt else False
@@ -615,7 +948,7 @@ with tab1:
                                     non_valid_reason = f"Drug exposure prior to Launch; {', '.join(sorted(set(exposure_reasons)))}"
                         displayed_drugs_assessment.append((display_name_for_detail or "Unknown product", non_valid_reason))
 
-                        case_drug_dates_display.append((matched_company_prod, None, start_date_obj, None))
+                        case_drug_dates_display.append((matched_company_prod, observed_strengths, start_date_obj, stop_date_obj))
 
             seriousness_criteria = list(seriousness_map.keys())
             event_details_list: List[str] = []
@@ -752,12 +1085,57 @@ with tab1:
                 if any(name and MY_COMPANY_NAME.lower() not in name.lower() for name in case_displayed_mahs):
                     validity_reason = "Non-company product"
 
-            if validity_reason is None:
+            # --------------------- VALIDITY LOGIC (UPDATED) ---------------------
+
+            validity_reason: Optional[str] = None
+            validity_comment: Optional[str] = None
+            
+            has_any_suspect = bool(suspect_ids)
+            has_celix_suspect = bool(case_products_norm)
+            
+            # Rule 1: Patient details
+            if not has_any_patient_detail:
+                validity_reason = "No patient details"
+            
+            # Rule 2: Suspect but non-company
+            if validity_reason is None and has_any_suspect and not has_celix_suspect:
+                validity_reason = "Non-company product"
+            
+            # Rule 3: MAH check
+            if validity_reason is None and case_displayed_mahs:
+                if any(
+                    name and MY_COMPANY_NAME.lower() not in name.lower()
+                    for name in case_displayed_mahs
+                ):
+                    validity_reason = "Non-company product"
+            
+            # Rule 4: Product launch status (FIXED for multi-drug)
+            if validity_reason is None and case_drug_dates_display:
+            
+                any_valid_drug = False
+                non_valid_products = []
+            
                 for prod, strength_mg, sdt, edt in case_drug_dates_display:
                     status = get_launch_status(prod)
+            
                     if status in ("yet", "awaited"):
-                        validity_reason = "Product not Launched"
-                        break
+                        non_valid_products.append(prod)
+                    else:
+                        any_valid_drug = True
+            
+                # Case-level decision
+                if not any_valid_drug:
+                    # ALL suspect drugs are non-valid
+                    validity_reason = "Product not Launched"
+                else:
+                    # Mixed validity → case is VALID
+                    if non_valid_products:
+                        non_valid_list = ", ".join(sorted(set(non_valid_products)))
+                        validity_comment = (
+                            "Note: The following suspect drug(s) were assessed as non-valid "
+                            f"due to launch status: {non_valid_list}. "
+                            "Case validity is based on the presence of at least one valid suspect drug."
+                        )
 
             earliest_launch_dt = None
             for prod, strength_mg, sdt, edt in case_drug_dates_display:
@@ -791,11 +1169,55 @@ with tab1:
                 if exposure_reasons:
                     validity_reason = f"Drug exposure prior to Launch; {', '.join(sorted(set(exposure_reasons)))}"
 
-            validity_value = f"Non-Valid ({validity_reason})" if validity_reason else "Valid"
-
             narrative_elem = root.find('.//hl7:code[@code="PAT_ADV_EVNT"]/../hl7:text', ns)
             narrative_full_raw = narrative_elem.text if narrative_elem is not None else ''
             narrative_full = clean_value(narrative_full_raw)
+
+            # OFEV check applies only for Nintedanib suspect product(s).
+            has_ofev_in_narrative = bool(re.search(r'\bofev\b', normalize_text(narrative_full)))
+            has_nintedanib_suspect = ('nintedanib' in case_products_norm)
+            if has_ofev_in_narrative and has_nintedanib_suspect:
+                adjusted_assessments: List[Tuple[str, str]] = []
+                nintedanib_rows_found = False
+                for nm, rsn in displayed_drugs_assessment:
+                    if re.search(r'\bnintedanib\b', normalize_text(nm)):
+                        nintedanib_rows_found = True
+                        rsn = "Non-company product OFEV"
+                    adjusted_assessments.append((nm, rsn))
+                displayed_drugs_assessment = adjusted_assessments
+
+                # Preserve existing case logic: make case non-valid only when
+                # no suspect drug remains valid.
+                if validity_reason != "No patient details" and nintedanib_rows_found:
+                    if len(displayed_drugs_assessment) == 1 or all(rsn for _, rsn in displayed_drugs_assessment):
+                        validity_reason = "Non-company product OFEV"
+
+            # Nullification/amendment check applies to every case.
+            has_nullification_or_amendment = False
+            nullification_reason_elem = root.find(
+                './/hl7:code[@displayName="nullificationAmendmentReason"]/../hl7:value/hl7:originalText',
+                ns
+            )
+            if (
+                nullification_reason_elem is not None
+                and nullification_reason_elem.text
+                and nullification_reason_elem.text.strip()
+            ):
+                has_nullification_or_amendment = True
+            else:
+                nullification_code_elem = root.find(
+                    './/hl7:code[@displayName="nullificationAmendmentCode"]/../hl7:value',
+                    ns
+                )
+                if nullification_code_elem is not None:
+                    code_val = clean_value(nullification_code_elem.attrib.get('code', ''))
+                    if code_val:
+                        has_nullification_or_amendment = True
+
+            if has_nullification_or_amendment:
+                comments.append("check nullification or amendment comment")
+
+            validity_value = f"Non-Valid ({validity_reason})" if validity_reason else "Valid"
 
             if comments and validity_reason is None:
                 validity_value = "Kindly check comment and assess validity manually"
@@ -840,6 +1262,30 @@ with tab1:
                         prod_lines.append(f"{pretty} - " + "; ".join(statuses))
                     event_wise_listedness_display = "\n".join(prod_lines)
 
+            molecule_names_for_filename = [pnorm.title() for pnorm in sorted(list(case_products_norm))]
+            suspect_products_preferred = [
+                product_norm_to_pretty.get(pnorm, pnorm.title())
+                for pnorm in sorted(list(case_products_norm), key=lambda k: product_norm_to_pretty.get(k, k))
+            ]
+            suspect_product_display = "; ".join(suspect_products_preferred) if suspect_products_preferred else "; ".join(dict.fromkeys(suspect_product_names_all))
+            seriousness_value = "Serious" if case_has_serious_event else "Non-serious"
+            comment_value = "; ".join(sorted(set(comments))) if comments else ""
+            tracker_comment_value = build_tracker_comment(validity_value, comment_value)
+            suggested_xml_filename = build_suggested_xml_filename(
+                sender_id,
+                validity_value,
+                case_has_serious_event,
+                molecule_names_for_filename,
+                fallback_stem=original_file_stem
+            )
+            renamed_xml_meta[idx] = {
+                "xml_bytes": xml_bytes,
+                "safety_id": sender_id,
+                "is_serious": case_has_serious_event,
+                "molecule_names": molecule_names_for_filename,
+                "fallback_stem": original_file_stem,
+            }
+
             all_rows_display.append({
                 'SL No': idx,
                 'Date': current_date,
@@ -853,8 +1299,16 @@ with tab1:
                 'Listedness': ('' if is_non_valid_case else event_wise_listedness_display),
                 'Narrative': narrative_full,
                 'Validity': validity_value,
-                'Comment': "; ".join(sorted(set(comments))) if comments else "",
+                'Comment': comment_value,
                 'Reportability': reportability,
+                'Receipt Date': current_date,
+                'Referance ID': sender_id,
+                'IRD': td_disp,
+                'Suspect Product': suspect_product_display,
+                'Seriousness': seriousness_value,
+                'Safety Report ID': 'WIP',
+                'Tracker Comment': tracker_comment_value,
+                'Suggested XML File Name': suggested_xml_filename,
                 'Parsing Warnings': "; ".join(warnings) if warnings else ""
             })
 
@@ -876,21 +1330,128 @@ with tab2:
         preferred_order = [
             'SL No','Date','Sender ID','Report Date','Case Age (days)','Reporter Qualification',
             'Patient Detail','Product Detail','Event Details','Listedness','Narrative',
-            'Validity','Comment','Reportability','Parsing Warnings'
+            'Validity','Comment','Reportability','Suggested XML File Name','Parsing Warnings'
         ]
         df_display = df_display[[c for c in preferred_order if c in df_display.columns]]
 
+        editable_columns = [c for c in df_display.columns if c != 'Validity']
         edited_df = st.data_editor(
             df_display,
             num_rows="dynamic",
             use_container_width=True,
-            disabled=df_display.columns
+            disabled=editable_columns,
+            key="parsed_table_editor"
         )
+
+        # Recompute suggested XML file name after manual edits to Validity.
+        if 'Suggested XML File Name' in edited_df.columns:
+            used_edited_names: Set[str] = set()
+            recomputed_names = []
+            for _, row in edited_df.iterrows():
+                sl_no = row.get('SL No')
+                meta = renamed_xml_meta.get(sl_no)
+                if meta:
+                    new_name = build_suggested_xml_filename(
+                        meta['safety_id'],
+                        row.get('Validity', ''),
+                        meta['is_serious'],
+                        meta['molecule_names'],
+                        fallback_stem=meta['fallback_stem']
+                    )
+                    new_name = make_unique_filename(new_name, used_edited_names)
+                else:
+                    new_name = row.get('Suggested XML File Name', '')
+                recomputed_names.append(new_name)
+            edited_df['Suggested XML File Name'] = recomputed_names
 
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
             edited_df.to_excel(writer, index=False, sheet_name="Parsed Data")
-        st.download_button("\u2B07\uFE0F Download Excel", excel_buffer.getvalue(), "parsed_data.xlsx")
+        st.download_button("⬇️ Download Excel", excel_buffer.getvalue(), "parsed_data.xlsx")
+
+        if not edited_df.empty and renamed_xml_meta:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+                for _, row in edited_df.iterrows():
+                    sl_no = row.get('SL No')
+                    meta = renamed_xml_meta.get(sl_no)
+                    if not meta:
+                        continue
+                    file_name = row.get('Suggested XML File Name', '')
+                    if not file_name:
+                        file_name = build_suggested_xml_filename(
+                            meta['safety_id'],
+                            row.get('Validity', ''),
+                            meta['is_serious'],
+                            meta['molecule_names'],
+                            fallback_stem=meta['fallback_stem']
+                        )
+                    zip_file.writestr(file_name, meta['xml_bytes'])
+            st.download_button("⬇️ Download Renamed XML Files (.zip)", zip_buffer.getvalue(), "renamed_xml_files.zip", mime="application/zip")
+    else:
+        st.info("No data available yet. Please upload files in the first tab.")
+
+with tab3:
+    st.markdown("### 📋 Tracker Copy Format")
+    if all_rows_display:
+        tracker_source_df = pd.DataFrame(all_rows_display)
+
+        if edited_df is not None and not edited_df.empty and 'SL No' in edited_df.columns and 'SL No' in tracker_source_df.columns:
+            tracker_source_df = tracker_source_df.set_index('SL No')
+            edited_updates = edited_df.set_index('SL No')
+            for col in ['Validity', 'Suggested XML File Name']:
+                if col in tracker_source_df.columns and col in edited_updates.columns:
+                    tracker_source_df[col] = edited_updates[col]
+            tracker_source_df = tracker_source_df.reset_index()
+
+        if 'IRD' not in tracker_source_df.columns and 'Report Date' in tracker_source_df.columns:
+            tracker_source_df['IRD'] = tracker_source_df['Report Date'].apply(extract_td_value)
+        if 'Referance ID' not in tracker_source_df.columns and 'Sender ID' in tracker_source_df.columns:
+            tracker_source_df['Referance ID'] = tracker_source_df['Sender ID']
+        if 'Receipt Date' not in tracker_source_df.columns and 'Date' in tracker_source_df.columns:
+            tracker_source_df['Receipt Date'] = tracker_source_df['Date']
+        if 'Tracker Comment' not in tracker_source_df.columns:
+            tracker_source_df['Tracker Comment'] = tracker_source_df.apply(
+                lambda row: build_tracker_comment(row.get('Validity', ''), row.get('Comment', '')),
+                axis=1,
+            )
+        if 'Seriousness' not in tracker_source_df.columns:
+            tracker_source_df['Seriousness'] = ''
+        if 'Suspect Product' not in tracker_source_df.columns:
+            tracker_source_df['Suspect Product'] = ''
+
+        tracker_df = pd.DataFrame({
+            'Receipt Date': tracker_source_df['Receipt Date'].fillna(''),
+            'Source': 'MHRA',
+            'Referance ID': tracker_source_df['Referance ID'].fillna(''),
+            'IRD': tracker_source_df['IRD'].fillna(''),
+            'Suspect Product': tracker_source_df['Suspect Product'].apply(simplify_tracker_product).fillna(''),
+            'Validity': tracker_source_df['Validity'].apply(simplify_tracker_validity).fillna(''),
+            'Seriousness': tracker_source_df['Validity'].apply(lambda x: 'NA' if clean_value(x).startswith('Non-Valid') else '').where(
+                tracker_source_df['Validity'].apply(lambda x: clean_value(x).startswith('Non-Valid')),
+                tracker_source_df['Seriousness'].fillna('')
+            ),
+            'Safety Report ID': tracker_source_df['Validity'].apply(lambda x: 'NA' if clean_value(x).startswith('Non-Valid') else 'WIP'),
+            'Comment': tracker_source_df['Tracker Comment'].fillna(''),
+        })
+
+        st.dataframe(tracker_df, use_container_width=True, hide_index=True)
+
+        clipboard_ready_df = tracker_df.astype(str).replace({'nan': '', 'None': ''}, regex=False)
+        copy_text = '\n'.join(
+            '\t'.join(value.replace('\n', ' ').strip() for value in row)
+            for row in clipboard_ready_df.itertuples(index=False, name=None)
+        )
+
+        st.caption('Copy output below is headerless and tab-separated, ready to paste into the tracker.')
+        st.text_area('Preview (without header)', copy_text, height=220, key='tracker_copy_preview')
+
+        copy_html = f"""
+        <textarea id="tracker-copy-source" style="position:absolute; left:-9999px; top:-9999px;">{html.escape(copy_text)}</textarea>
+        <button onclick="navigator.clipboard.writeText(document.getElementById('tracker-copy-source').value).then(function(){{document.getElementById('tracker-copy-status').innerText='Copied to clipboard!';}}).catch(function(){{document.getElementById('tracker-copy-status').innerText='Copy failed. Please copy from the preview box.';}});" style="padding:0.5rem 0.9rem; border:1px solid #d0d0d0; border-radius:0.4rem; background:#f4f4f4; cursor:pointer;">Copy without header</button>
+        <div id="tracker-copy-status" style="margin-top:0.5rem; font-family:sans-serif; color:#333;"></div>
+        """
+        st.components.v1.html(copy_html, height=90)
     else:
         st.info("No data available yet. Please upload files in the first tab.")
 
@@ -900,33 +1461,96 @@ _Disclaimer: App is in developmental stage, validate before using the data._
 """, unsafe_allow_html=True)
 
 
+with tab4:
+    st.markdown("### 📨 ACK XML Upload, Rename & Download")
+    st.caption("Upload ACK XML files. The app extracts Sender ID, Safety Report ID, ACK code, classifies Valid/Non-Valid, and renames files as Sender ID_Ack.xml.")
 
+    ack_uploaded_files = st.file_uploader(
+        "Upload ACK XML files",
+        type=["xml"],
+        accept_multiple_files=True,
+        help="Upload one or more acknowledgement XML files.",
+        key=f"ack_xml_uploader_{st.session_state.get('uploader_version', 0)}"
+    )
 
+    if ack_uploaded_files:
+        ack_rows: List[Dict[str, str]] = []
+        ack_download_items: List[Dict[str, object]] = []
+        used_ack_names: Set[str] = set()
 
+        for ack_idx, ack_file in enumerate(ack_uploaded_files, start=1):
+            ack_bytes = ack_file.getvalue()
+            ack_meta = parse_ack_xml_metadata(ack_bytes, ack_file.name)
+            unique_name = make_unique_filename(ack_meta['Renamed File Name'], used_ack_names)
+            ack_meta['Renamed File Name'] = unique_name
+            ack_meta['SL No'] = ack_idx
+            ack_rows.append(ack_meta)
+            ack_download_items.append({
+                'SL No': ack_idx,
+                'file_name': unique_name,
+                'xml_bytes': ack_bytes,
+                'status': ack_meta['ACK Status'],
+                'sender_id': ack_meta['Sender ID'],
+                'safety_report_id': ack_meta['Safety Report ID'],
+            })
 
+        ack_df = pd.DataFrame(ack_rows)
+        ack_display_order = [
+            'SL No', 'Original File Name', 'Sender ID', 'Safety Report ID',
+            'ACK Code', 'ACK Status', 'Error Comment', 'Renamed File Name'
+        ]
+        ack_df = ack_df[[c for c in ack_display_order if c in ack_df.columns]]
+        st.dataframe(ack_df, use_container_width=True, hide_index=True)
 
+        valid_items = [item for item in ack_download_items if item['status'] == 'Valid']
+        non_valid_items = [item for item in ack_download_items if item['status'] != 'Valid']
 
+        summary_col1, summary_col2, summary_col3 = st.columns(3)
+        summary_col1.metric('Total ACK XMLs', len(ack_download_items))
+        summary_col2.metric('Valid', len(valid_items))
+        summary_col3.metric('Non-Valid', len(non_valid_items))
 
+        zip_col1, zip_col2 = st.columns(2)
 
+        valid_zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(valid_zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED) as zip_file:
+            for item in valid_items:
+                zip_file.writestr(item['file_name'], item['xml_bytes'])
+        zip_col1.download_button(
+            '⬇️ Download Valid ACK XMLs (.zip)',
+            valid_zip_buffer.getvalue(),
+            'valid_ack_xmls.zip',
+            mime='application/zip',
+            disabled=(len(valid_items) == 0),
+            key='download_valid_ack_zip'
+        )
 
+        non_valid_zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(non_valid_zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED) as zip_file:
+            for item in non_valid_items:
+                zip_file.writestr(item['file_name'], item['xml_bytes'])
+        zip_col2.download_button(
+            '⬇️ Download Non-Valid ACK XMLs (.zip)',
+            non_valid_zip_buffer.getvalue(),
+            'non_valid_ack_xmls.zip',
+            mime='application/zip',
+            disabled=(len(non_valid_items) == 0),
+            key='download_non_valid_ack_zip'
+        )
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        st.markdown('#### Individual File Downloads')
+        for item in ack_download_items:
+            row_col1, row_col2, row_col3, row_col4 = st.columns([1.1, 1.6, 2.4, 1.2])
+            row_col1.write(f"**{item['status']}**")
+            row_col2.write(f"**Sender ID:** {item['sender_id']}")
+            row_col3.write(f"**Safety Report ID:** {item['safety_report_id'] or 'Not found'}")
+            row_col4.download_button(
+                'Download',
+                item['xml_bytes'],
+                item['file_name'],
+                mime='application/xml',
+                key=f"download_ack_{item['SL No']}"
+            )
+    else:
+        st.info('Upload ACK XML files to generate Sender ID_Ack filenames and download options.')
 
