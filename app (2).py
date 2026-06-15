@@ -507,17 +507,22 @@ def _first_xml_value_by_local_names(root: ET.Element, local_names, attr_names=('
     return ''
 
 
-def _all_xml_values_by_local_name(root: ET.Element, local_name: str, attr_names=('extension', 'value', 'root')) -> List[str]:
-    matches: List[str] = []
-    wanted = str(local_name or '').strip().lower()
-    if root is None or not wanted:
-        return matches
-    for elem in root.iter():
-        if local_tag_name(elem.tag) == wanted:
-            value = xml_text_or_attr(elem, *attr_names)
-            if value:
-                matches.append(value)
-    return matches
+def ack_zip_group_from_first_tab_validity(validity_value: str) -> str:
+    validity_text = clean_value(validity_value)
+    if validity_text == 'Valid':
+        return 'Valid'
+    if validity_text.startswith('Non-Valid'):
+        return 'Non-Valid'
+    return 'Other'
+
+
+def build_first_tab_validity_lookup(rows: List[Dict]) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    for row in rows or []:
+        key = clean_value(row.get('Sender ID', ''))
+        if key and key not in lookup:
+            lookup[key] = clean_value(row.get('Validity', ''))
+    return lookup
 
 
 def classify_ack_validity(ack_code: str, error_comment: str) -> str:
@@ -528,40 +533,48 @@ def classify_ack_validity(ack_code: str, error_comment: str) -> str:
     return 'Non-Valid'
 
 
+def resolve_ack_case_id(root: ET.Element, original_name: str) -> str:
+    fallback_stem = Path(original_name).stem
+    case_id = _first_xml_value_by_local_names(root, ['safetyreportid'])
+    if case_id:
+        return case_id
+    case_id = _first_xml_value_by_local_names(
+        root,
+        ['senderidentifier', 'senderid', 'sender', 'sendername', 'sendingorganization', 'sendingorganizationidentifier']
+    )
+    return case_id or fallback_stem
+
+
 def parse_ack_xml_metadata(xml_bytes: bytes, original_name: str) -> Dict[str, str]:
     fallback_stem = Path(original_name).stem
     try:
         root = ET.fromstring(xml_bytes)
     except Exception as exc:
+        fallback_case_id = sanitize_filename_component(fallback_stem)
         return {
             'Original File Name': original_name,
-            'Sender ID': fallback_stem,
-            'Safety Report ID': '',
+            'Case ID': fallback_case_id,
             'ACK Code': '',
-            'ACK Status': 'Non-Valid',
+            'ACK Derived Status': 'Non-Valid',
+            'Mapped First-Tab Validity': '',
+            'ZIP Group': 'Other',
             'Error Comment': f'XML parse error: {exc}',
-            'Renamed File Name': f'{sanitize_filename_component(fallback_stem)}_Ack.xml',
+            'Renamed File Name': f'{fallback_case_id}_Ack.xml',
         }
 
-    sender_id = _first_xml_value_by_local_names(
-        root,
-        ['senderidentifier', 'senderid', 'sender', 'sendername', 'sendingorganization', 'sendingorganizationidentifier']
-    )
-    if not sender_id:
-        sender_id = fallback_stem
-
-    safety_report_id = _first_xml_value_by_local_names(root, ['safetyreportid'])
+    case_id = resolve_ack_case_id(root, original_name)
     ack_code = _first_xml_value_by_local_names(root, ['reportacknowledgmentcode', 'acknowledgmentcode', 'ackcode'])
     error_comment = _first_xml_value_by_local_names(root, ['errormessagecomment', 'errorcomment', 'errortext'])
     ack_status = classify_ack_validity(ack_code, error_comment)
-    renamed_file_name = f"{sanitize_filename_component(sender_id)}_Ack.xml"
+    renamed_file_name = f"{sanitize_filename_component(case_id)}_Ack.xml"
 
     return {
         'Original File Name': original_name,
-        'Sender ID': sender_id,
-        'Safety Report ID': safety_report_id,
+        'Case ID': case_id,
         'ACK Code': ack_code,
-        'ACK Status': ack_status,
+        'ACK Derived Status': ack_status,
+        'Mapped First-Tab Validity': '',
+        'ZIP Group': 'Other',
         'Error Comment': error_comment,
         'Renamed File Name': renamed_file_name,
     }
@@ -1463,7 +1476,11 @@ _Disclaimer: App is in developmental stage, validate before using the data._
 
 with tab4:
     st.markdown("### 📨 ACK XML Upload, Rename & Download")
-    st.caption("Upload ACK XML files. The app extracts Sender ID, Safety Report ID, ACK code, classifies Valid/Non-Valid, and renames files as Sender ID_Ack.xml.")
+    st.caption("Upload ACK XML files. The app uses a single Case ID (Sender ID / Safety Report ID treated as the same), renames files as CaseID_Ack.xml, and maps validity from the first tab using the same Case ID.")
+
+    first_tab_validity_lookup = build_first_tab_validity_lookup(all_rows_display)
+    if not first_tab_validity_lookup:
+        st.info("Tip: Upload and parse the main case XMLs in the first tab first if you want ACK validity to exactly follow the first-tab categorization.")
 
     ack_uploaded_files = st.file_uploader(
         "Upload ACK XML files",
@@ -1481,34 +1498,43 @@ with tab4:
         for ack_idx, ack_file in enumerate(ack_uploaded_files, start=1):
             ack_bytes = ack_file.getvalue()
             ack_meta = parse_ack_xml_metadata(ack_bytes, ack_file.name)
+            case_id = clean_value(ack_meta.get('Case ID', ''))
+            mapped_validity = first_tab_validity_lookup.get(case_id, '')
+            zip_group = ack_zip_group_from_first_tab_validity(mapped_validity)
+
             unique_name = make_unique_filename(ack_meta['Renamed File Name'], used_ack_names)
             ack_meta['Renamed File Name'] = unique_name
+            ack_meta['Mapped First-Tab Validity'] = mapped_validity or 'Case ID not found in first tab'
+            ack_meta['ZIP Group'] = zip_group
             ack_meta['SL No'] = ack_idx
             ack_rows.append(ack_meta)
             ack_download_items.append({
                 'SL No': ack_idx,
                 'file_name': unique_name,
                 'xml_bytes': ack_bytes,
-                'status': ack_meta['ACK Status'],
-                'sender_id': ack_meta['Sender ID'],
-                'safety_report_id': ack_meta['Safety Report ID'],
+                'zip_group': zip_group,
+                'case_id': case_id,
+                'mapped_validity': mapped_validity,
+                'ack_status': ack_meta['ACK Derived Status'],
             })
 
         ack_df = pd.DataFrame(ack_rows)
         ack_display_order = [
-            'SL No', 'Original File Name', 'Sender ID', 'Safety Report ID',
-            'ACK Code', 'ACK Status', 'Error Comment', 'Renamed File Name'
+            'SL No', 'Original File Name', 'Case ID', 'Mapped First-Tab Validity',
+            'ACK Code', 'ACK Derived Status', 'Error Comment', 'Renamed File Name'
         ]
         ack_df = ack_df[[c for c in ack_display_order if c in ack_df.columns]]
         st.dataframe(ack_df, use_container_width=True, hide_index=True)
 
-        valid_items = [item for item in ack_download_items if item['status'] == 'Valid']
-        non_valid_items = [item for item in ack_download_items if item['status'] != 'Valid']
+        valid_items = [item for item in ack_download_items if item['zip_group'] == 'Valid']
+        non_valid_items = [item for item in ack_download_items if item['zip_group'] == 'Non-Valid']
+        other_items = [item for item in ack_download_items if item['zip_group'] == 'Other']
 
-        summary_col1, summary_col2, summary_col3 = st.columns(3)
+        summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
         summary_col1.metric('Total ACK XMLs', len(ack_download_items))
-        summary_col2.metric('Valid', len(valid_items))
-        summary_col3.metric('Non-Valid', len(non_valid_items))
+        summary_col2.metric('Valid (from Tab 1)', len(valid_items))
+        summary_col3.metric('Non-Valid (from Tab 1)', len(non_valid_items))
+        summary_col4.metric('Not Mapped / Manual', len(other_items))
 
         zip_col1, zip_col2 = st.columns(2)
 
@@ -1538,12 +1564,15 @@ with tab4:
             key='download_non_valid_ack_zip'
         )
 
+        if other_items:
+            st.caption('Files marked as Not Mapped / Manual are still available through the individual Download buttons below, but are excluded from the Valid and Non-Valid zip downloads.')
+
         st.markdown('#### Individual File Downloads')
         for item in ack_download_items:
-            row_col1, row_col2, row_col3, row_col4 = st.columns([1.1, 1.6, 2.4, 1.2])
-            row_col1.write(f"**{item['status']}**")
-            row_col2.write(f"**Sender ID:** {item['sender_id']}")
-            row_col3.write(f"**Safety Report ID:** {item['safety_report_id'] or 'Not found'}")
+            row_col1, row_col2, row_col3, row_col4 = st.columns([1.3, 1.8, 2.6, 1.2])
+            row_col1.write(f"**{item['zip_group']}**")
+            row_col2.write(f"**Case ID:** {item['case_id'] or 'Not found'}")
+            row_col3.write(f"**Tab 1 Validity:** {item['mapped_validity'] or 'Case ID not found in first tab'}")
             row_col4.download_button(
                 'Download',
                 item['xml_bytes'],
@@ -1552,5 +1581,5 @@ with tab4:
                 key=f"download_ack_{item['SL No']}"
             )
     else:
-        st.info('Upload ACK XML files to generate Sender ID_Ack filenames and download options.')
+        st.info('Upload ACK XML files to generate CaseID_Ack filenames and download options.')
 
